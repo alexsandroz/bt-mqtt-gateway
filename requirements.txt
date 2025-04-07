@@ -3,3 +3,6 @@ pyyaml
 interruptingcow
 apscheduler
 tenacity
+setuptools
+pytz
+bluepy
