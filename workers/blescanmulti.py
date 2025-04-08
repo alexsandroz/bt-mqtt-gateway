@@ -1,6 +1,6 @@
 import time
 
-from mqtt import MqttMessage, MqttConfigMessage, MqttClient
+from mqtt import MqttMessage, MqttConfigMessage
 
 from workers.base import BaseWorker
 from utils import booleanize
@@ -18,8 +18,8 @@ class BleDeviceStatus:
         name: str,
         available: bool = False,
         last_status_time: float = None,
-        message_sent: bool = True,
-        haas_config_sent: bool = False,
+        has_message: bool = True,
+        has_config_message: bool = True,
     ):
         if last_status_time is None:
             last_status_time = time.time()
@@ -29,14 +29,16 @@ class BleDeviceStatus:
         self.name = name
         self.available = available
         self.last_status_time = last_status_time
-        self.message_sent = message_sent
-        self.hass_config_sent = haas_config_sent
+        self.has_message = has_message
+        self.has_config_message = has_config_message
 
     def set_status(self, scanEntry):
+        if scanEntry is None and self.available:
+            self.has_message = True
         self.available = scanEntry is not None
         if self.available:
             self.last_status_time = time.time()
-            self.message_sent = False
+            self.has_message = True
 
     def _timeout(self):
         if self.available:
@@ -48,32 +50,11 @@ class BleDeviceStatus:
         elapsed = time.time() - self.last_status_time
         return elapsed > self._timeout()
 
-    def payload(self):
+    def online_payload(self):
         if self.available:
-            return self.worker.available_payload
+            return "online"
         else:
-            return self.worker.unavailable_payload
-
-    def payload_hass_config_device_tracker(self, device):
-        ret =  '{'
-        ret += '"dev":{'
-        ret += '"ids":["{}"],'.format(self.name)
-        ret += '"cns":[["mac","{}"]],'.format(self.mac)
-        ret += '"name":"{}"'.format(self.name)
-        #ret += '"sw": "",'
-        #ret += '"mf": "",'
-        #ret += '"mdl": "",'
-        #ret += '"cu": ""'
-        ret += '},'
-        ret += '"name":"tracker",'
-        ret += '"~":"{}/{}/presence/{}",'.format(self.worker.global_topic_prefix, self.worker.topic_prefix, self.name)
-        ret += '"uniq_id":"{}_tracker",'.format(self.name)
-        ret += '"qos":1,'
-        ret += '"stat_t":"~",'
-        ret += '"avty_t": "~/LTW",'
-        ret += '"source_type":"bluetooth_le"'
-        ret += '}'
-        return ret
+            return "offline"
 
     def payload_hass_config_rssi(self, device):
         ret =  '{'
@@ -81,75 +62,79 @@ class BleDeviceStatus:
         ret += '"ids":["{}"],'.format(self.name)
         ret += '"cns":[["mac","{}"]],'.format(self.mac)
         ret += '"name":"{}"'.format(self.name)
-        #ret += '"sw": "",'
-        #ret += '"mf": "",'
-        #ret += '"mdl": "",'
-        #ret += '"cu": ""'
         ret += '},'
         ret += '"name":"rssi",'
-        ret += '"~":"{}/{}/presence/{}",'.format(self.worker.global_topic_prefix, self.worker.topic_prefix, self.name)
+        ret += '"~":"{}/{}/{}",'.format(self.worker.global_topic_prefix, self.worker.topic_prefix, self.name)
         ret += '"uniq_id":"{}_rssi",'.format(self.name)
         ret += '"qos":1,'
-        ret += '"dev_cla":"signal_strength",'
         ret += '"stat_t":"~/rssi",'
         ret += '"unit_of_meas":"dBm",'
-        ret += '"entity_category":"diagnostic",'
-        ret += '"avty_t": "~/LTW",'
+        ret += '"avty_t":"{}/LWT",'.format(self.worker.global_topic_prefix)
+        ret += '"dev_cla":"signal_strength",'
         ret += '"stat_cla":"measurement",'
+        ret += '"entity_category":"diagnostic",'
         ret += '"source_type":"bluetooth_le"'
         ret += '}'
         return ret
 
-    def generate_messages(self, device):
+    def payload_hass_config_online(self, device):
+        ret =  '{'
+        ret += '"dev":{'
+        ret += '"ids":["{}"],'.format(self.name)
+        ret += '"cns":[["mac","{}"]],'.format(self.mac)
+        ret += '"name":"{}"'.format(self.name)
+        ret += '},'
+        ret += '"name":"online",'
+        ret += '"~":"{}/{}/{}",'.format(self.worker.global_topic_prefix, self.worker.topic_prefix, self.name)
+        ret += '"uniq_id":"{}_online",'.format(self.name)
+        ret += '"qos":1,'
+        ret += '"stat_t":"~/online",'
+        ret += '"pl_on":"online",'
+        ret += '"pl_off":"offline",'
+        ret += '"dev_cla":"connectivity",'
+        ret += '"avty_t":"{}/LWT",'.format(self.worker.global_topic_prefix)
+        ret += '"source_type":"bluetooth_le"'
+        ret += '}'
+        return ret
+
+
+    def generate_messages(self, scanEntry):
         messages = []
-        if not self.hass_config_sent and self.available:
-            self.hass_config_sent = True
-            #MqttClient.mqttc.will_set(
-            #            topic=self.worker.format_topic("presence/{}".format(self.name)),
-            #            payload=MqttClient.LWT_ONLINE, retain=True)
+        if self.available and self.has_config_message:
+            messages.append(
+                MqttConfigMessage("homeassistant", "binary_sensor/{}_online".format(self.name),
+                    payload=self.payload_hass_config_online(scanEntry), retain=True)
+            )
             messages.append(
                 MqttConfigMessage("homeassistant", "sensor/{}_rssi".format(self.name),
-                    payload=self.payload_hass_config_rssi(device), retain=True)
+                    payload=self.payload_hass_config_rssi(scanEntry), retain=True)
             )
-            messages.append(
-                MqttConfigMessage("homeassistant", "device_tracker/{}".format(self.name),
-                    payload=self.payload_hass_config_device_tracker(device), retain=True)
-            )
-        if not self.message_sent and self.has_time_elapsed():
-            self.message_sent = True
+            self.has_config_message = False
+        if self.has_message and self.has_time_elapsed():
             messages.append(
                 MqttMessage(
-                    topic=self.worker.format_topic("presence/{}".format(self.name)),
-                    payload=self.payload(),
+                    topic=self.worker.format_topic(
+                        "{}/online".format(self.name)
+                    ),
+                    payload=self.online_payload()
                 )
-            )
+            )            
             if self.available:
                 messages.append(
                     MqttMessage(
                         topic=self.worker.format_topic(
-                            "presence/{}/rssi".format(self.name)
+                            "{}/rssi".format(self.name)
                         ),
-                        payload=device.rssi,
+                        payload=scanEntry.rssi
                     )
                 )            
-                messages.append(
-                    MqttMessage(
-                        topic=self.worker.format_topic(
-                            "presence/{}/{}".format(self.name, "LTW")
-                        ),
-                        payload="online", retain=True,
-                    )
-                )            
+            self.has_message = False
         return messages
         
 
 class BlescanmultiWorker(BaseWorker):
     # Default values
     devices = {}
-    # Payload that should be send when device is available
-    available_payload = "home"  # type: str
-    # Payload that should be send when device is unavailable
-    unavailable_payload = "not_home"  # type: str
     # After what time (in seconds) we should inform that device is available (default: 0 seconds)
     available_timeout = 0  # type: float
     # After what time (in seconds) we should inform that device is unavailable (default: 60 seconds)
@@ -166,7 +151,7 @@ class BlescanmultiWorker(BaseWorker):
 
             def handleDiscovery(self, dev, isNewDev, isNewData):
                 if isNewDev:
-                    _LOGGER.debug("Discovered new device: %s" % dev.addr)
+                    _LOGGER.debug("Discovered new device: %s rssi: %d", dev.addr, dev.rssi)
 
         super(BlescanmultiWorker, self).__init__(*args, **kwargs)
         self.scanner = Scanner().withDelegate(ScanDelegate())
@@ -201,5 +186,7 @@ class BlescanmultiWorker(BaseWorker):
                 type(e).__name__,
                 suppress=True,
             )
+        finally:            
+            self.scanner.clear()
 
         return ret
