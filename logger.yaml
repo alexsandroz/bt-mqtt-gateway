@@ -22,7 +22,7 @@ handlers:
 
 loggers:
   bt-mqtt-gw:
-    level: INFO
+    level: DEBUG
   dummy_debug:
     handlers: [dummy_debug]
 

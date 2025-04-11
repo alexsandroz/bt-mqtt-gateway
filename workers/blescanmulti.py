@@ -17,28 +17,23 @@ class BleDeviceStatus:
         mac: str,
         name: str,
         available: bool = False,
-        last_status_time: float = None,
-        has_message: bool = True,
+        last_update: float = None,
         has_config_message: bool = True,
     ):
-        if last_status_time is None:
-            last_status_time = time.time()
+        if last_update is None:
+            last_update = 0
 
         self.worker = worker  # type: BlescanmultiWorker
         self.mac = mac.lower()
         self.name = name
         self.available = available
-        self.last_status_time = last_status_time
-        self.has_message = has_message
+        self.last_update = 0
         self.has_config_message = has_config_message
 
     def set_status(self, scanEntry):
-        if scanEntry is None and self.available:
-            self.has_message = True
         self.available = scanEntry is not None
         if self.available:
-            self.last_status_time = time.time()
-            self.has_message = True
+            self.last_update = time.time()
 
     def _timeout(self):
         if self.available:
@@ -47,7 +42,7 @@ class BleDeviceStatus:
             return self.worker.unavailable_timeout
 
     def has_time_elapsed(self):
-        elapsed = time.time() - self.last_status_time
+        elapsed = time.time() - self.last_update
         return elapsed > self._timeout()
 
     def online_payload(self):
@@ -56,28 +51,13 @@ class BleDeviceStatus:
         else:
             return "offline"
 
-    def payload_hass_config_rssi(self, device):
-        ret =  '{'
-        ret += '"dev":{'
-        ret += '"ids":["{}"],'.format(self.name)
-        ret += '"cns":[["mac","{}"]],'.format(self.mac)
-        ret += '"name":"{}"'.format(self.name)
-        ret += '},'
-        ret += '"name":"rssi",'
-        ret += '"~":"{}/{}/{}",'.format(self.worker.global_topic_prefix, self.worker.topic_prefix, self.name)
-        ret += '"uniq_id":"{}_rssi",'.format(self.name)
-        ret += '"qos":1,'
-        ret += '"stat_t":"~/rssi",'
-        ret += '"unit_of_meas":"dBm",'
-        ret += '"avty_t":"{}/LWT",'.format(self.worker.global_topic_prefix)
-        ret += '"dev_cla":"signal_strength",'
-        ret += '"stat_cla":"measurement",'
-        ret += '"entity_category":"diagnostic",'
-        ret += '"source_type":"bluetooth_le"'
-        ret += '}'
-        return ret
+    def rssi_payload(self, scanEntry):
+        if self.available:
+            return scanEntry.rssi
+        else:
+            return "offline"
 
-    def payload_hass_config_online(self, device):
+    def payload_hass_config_online(self):
         ret =  '{'
         ret += '"dev":{'
         ret += '"ids":["{}"],'.format(self.name)
@@ -85,7 +65,7 @@ class BleDeviceStatus:
         ret += '"name":"{}"'.format(self.name)
         ret += '},'
         ret += '"name":"online",'
-        ret += '"~":"{}/{}/{}",'.format(self.worker.global_topic_prefix, self.worker.topic_prefix, self.name)
+        ret += '"~":"{}/{}",'.format(self.worker.global_topic_prefix, self.worker.format_topic(self.name))
         ret += '"uniq_id":"{}_online",'.format(self.name)
         ret += '"qos":1,'
         ret += '"stat_t":"~/online",'
@@ -97,20 +77,44 @@ class BleDeviceStatus:
         ret += '}'
         return ret
 
+    def payload_hass_config_rssi(self):
+        ret =  '{'
+        ret += '"dev":{'
+        ret += '"ids":["{}"],'.format(self.name)
+        ret += '"cns":[["mac","{}"]],'.format(self.mac)
+        ret += '"name":"{}"'.format(self.name)
+        ret += '},'
+        ret += '"name":"rssi",'
+        ret += '"~":"{}/{}",'.format(self.worker.global_topic_prefix, self.worker.format_topic(self.name))
+        ret += '"uniq_id":"{}_rssi",'.format(self.name)
+        ret += '"qos":1,'
+        ret += '"stat_t":"~/rssi",'
+        ret += '"unit_of_meas":"dBm",'
+        ret += '"dev_cla":"signal_strength",'
+        ret += '"stat_cla":"measurement",'
+        ret += '"entity_category":"diagnostic",'
+        ret += '"availability_mode":"all",'
+        ret += '"availability":['
+        ret += '{"topic":"~/online"},'
+        ret += '{{"topic":"{}/LWT"}}],'.format(self.worker.global_topic_prefix)
+        ret += '"source_type":"bluetooth_le"'
+        ret += '}'
+        return ret
+
 
     def generate_messages(self, scanEntry):
         messages = []
         if self.available and self.has_config_message:
             messages.append(
                 MqttConfigMessage("homeassistant", "binary_sensor/{}_online".format(self.name),
-                    payload=self.payload_hass_config_online(scanEntry), retain=True)
+                    payload=self.payload_hass_config_online(), retain=True)
             )
             messages.append(
                 MqttConfigMessage("homeassistant", "sensor/{}_rssi".format(self.name),
-                    payload=self.payload_hass_config_rssi(scanEntry), retain=True)
+                    payload=self.payload_hass_config_rssi(), retain=True)
             )
             self.has_config_message = False
-        if self.has_message and self.has_time_elapsed():
+        if self.has_time_elapsed():
             messages.append(
                 MqttMessage(
                     topic=self.worker.format_topic(
@@ -119,16 +123,14 @@ class BleDeviceStatus:
                     payload=self.online_payload()
                 )
             )            
-            if self.available:
-                messages.append(
-                    MqttMessage(
-                        topic=self.worker.format_topic(
-                            "{}/rssi".format(self.name)
-                        ),
-                        payload=scanEntry.rssi
-                    )
-                )            
-            self.has_message = False
+            messages.append(
+                MqttMessage(
+                    topic=self.worker.format_topic(
+                        "{}/rssi".format(self.name)
+                    ),
+                    payload=self.rssi_payload(scanEntry)
+                )
+            )            
         return messages
         
 
@@ -159,6 +161,12 @@ class BlescanmultiWorker(BaseWorker):
             BleDeviceStatus(self, mac, name) for name, mac in self.devices.items()
         ]
         _LOGGER.info("Adding %d %s devices", len(self.devices), repr(self))
+
+    def format_topic(self, *topic_args):
+        if hasattr(self, 'topic_prefix'):
+            return "/".join([self.topic_prefix, *topic_args])
+        else:
+            return "/".join([*topic_args])
 
     def status_update(self):
         from bluepy import btle
